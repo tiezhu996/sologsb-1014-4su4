@@ -1,5 +1,5 @@
 import { redraw } from 'mithril';
-import type { ProofCheck, ProofDocument, ProofStep, ProofVersion } from './types';
+import type { ProofCheck, ProofDiff, ProofDocument, ProofStep, ProofVersion, VersionComparison } from './types';
 
 const STORAGE_KEY = 'sologsb-1014-proof-workspace-v1';
 const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -220,11 +220,12 @@ export class ProofStore {
         createdAt: new Date().toISOString(),
         steps: clone(document.steps),
         goal: document.goal,
+        symbols: clone(document.symbols),
       };
       document.versions.unshift(version);
       this.compareVersionId = version.id;
     });
-    this.notify('已保存当前证明快照');
+    this.notify('已保存当前证明快照（目标、符号表与步骤）');
   }
 
   notify(message: string): void {
@@ -242,19 +243,66 @@ function stripLatexCommands(text: string): string {
   return text.replace(/\\[A-Za-z]+/g, ' ').replace(/[{}_^]/g, ' ');
 }
 
+// 去除 $ 包裹与空白，用于“结论式子与证明目标相同”的比较。
+export function normalizeFormula(text: string): string {
+  return text.replace(/\$/g, '').replace(/\s+/g, '');
+}
+
+// 提取公式中出现的标识符 token（LaTeX 命令已先被剔除）。
+function formulaTokens(text: string): string[] {
+  return stripLatexCommands(text).match(/[A-Za-z][A-Za-z0-9']*|\d+/g) ?? [];
+}
+
+// 多字母并列（如 ab、ba）按每个字母拆分使用；纯数字不作为符号。
+function usedSymbols(text: string): Set<string> {
+  const used = new Set<string>();
+  formulaTokens(text)
+    .filter((token) => !/^\d+$/.test(token))
+    .forEach((token) => {
+      [...token].forEach((letter) => used.add(letter));
+    });
+  return used;
+}
+
 export function validate(document: ProofDocument): ProofCheck[] {
   const checks: ProofCheck[] = [];
   const ids = new Set(document.steps.map((step) => step.id));
   const symbolKeys = new Set(Object.keys(document.symbols));
-  const ignored = new Set(['a', 'A', 'b', 'B', 'n', 'k', 'P', 'Q', 'R', 'x', 'y', 'to', 'text', 'frac', 'sqrt']);
+  const stepLabel = (id: string): string => {
+    const index = document.steps.findIndex((step) => step.id === id);
+    return index >= 0 ? `步骤 ${index + 1}` : id;
+  };
+
+  // 1. 符号表中含义为空的符号——“有符号但没说明”。
+  Object.entries(document.symbols).forEach(([symbol, meaning]) => {
+    if (!meaning.trim()) {
+      checks.push({ id: `symbol-empty-${symbol}`, severity: 'error', title: '符号缺少说明', detail: `符号「${symbol}」在符号表中没有填写含义。` });
+    }
+  });
+
+  const reportUnknownSymbols = (text: string, stepId?: string, index?: number): void => {
+    const unknown = [...usedSymbols(text)].filter((token) => !symbolKeys.has(token));
+    if (unknown.length) {
+      const where = index === undefined ? '证明目标' : `步骤 ${index + 1}`;
+      checks.push({
+        id: `symbol-unknown-${stepId ?? 'goal'}-${unknown.join('-')}`,
+        severity: 'error',
+        title: '发现未定义符号',
+        detail: `${where} 使用了未在符号表中说明的符号：${unknown.join('、')}。`,
+        stepId,
+      });
+    }
+  };
+
+  // 2. 证明目标与每一步的式子，其符号都必须在符号表中有说明。
+  if (!document.goal.trim()) {
+    checks.push({ id: 'goal-empty', severity: 'error', title: '证明目标为空', detail: '请先填写证明目标，才能判定结论是否与目标一致。' });
+  } else {
+    reportUnknownSymbols(document.goal);
+  }
 
   document.steps.forEach((step, index) => {
-    const tokens = stripLatexCommands(step.statement).match(/\b[A-Za-z][A-Za-z0-9']*\b/g) ?? [];
-    const unknown = [...new Set(tokens.filter((token) => !symbolKeys.has(token) && !ignored.has(token)))];
-    if (unknown.length) {
-      checks.push({ id: `symbol-${step.id}`, severity: 'warning', title: '发现未定义符号', detail: `步骤 ${index + 1} 使用了：${unknown.join('、')}`, stepId: step.id });
-    }
-
+    reportUnknownSymbols(step.statement, step.id, index);
     step.references.forEach((reference) => {
       if (!ids.has(reference)) {
         checks.push({ id: `missing-${step.id}-${reference}`, severity: 'error', title: '引用步骤不存在', detail: `步骤 ${index + 1} 引用了已删除的步骤 ${reference}`, stepId: step.id });
@@ -262,7 +310,10 @@ export function validate(document: ProofDocument): ProofCheck[] {
     });
   });
 
+  // 有效引用构成的图（失效引用不参与）。
   const graph = new Map(document.steps.map((step) => [step.id, step.references.filter((id) => ids.has(id))]));
+
+  // 3. 循环引用检测。
   const visiting = new Set<string>();
   const visited = new Set<string>();
   const cycleStep = new Set<string>();
@@ -280,32 +331,159 @@ export function validate(document: ProofDocument): ProofCheck[] {
   };
   [...graph.keys()].forEach((id) => visit(id, []));
   if (cycleStep.size) {
-    checks.push({ id: 'cycle', severity: 'error', title: '检测到循环引用', detail: '引用链形成闭环，请调整步骤关系。', stepId: [...cycleStep][0] });
+    const labels = [...cycleStep].map(stepLabel).join('、');
+    checks.push({ id: 'cycle', severity: 'error', title: '检测到循环引用', detail: `引用链在 ${labels} 之间形成闭环，请调整步骤关系。`, stepId: [...cycleStep][0] });
   }
 
+  // 4. 每条非前提步骤必须能沿引用链回到某个前提。
+  const reachesPremiseCache = new Map<string, boolean>();
+  const reachesPremise = (id: string, seen: Set<string>): boolean => {
+    const cached = reachesPremiseCache.get(id);
+    if (cached !== undefined) return cached;
+    const step = document.steps.find((item) => item.id === id);
+    if (!step) return false;
+    if (step.type === 'premise') {
+      reachesPremiseCache.set(id, true);
+      return true;
+    }
+    if (seen.has(id)) return false; // 引用成环，不能当作回到前提的路径
+    seen.add(id);
+    const grounded = (graph.get(id) ?? []).some((reference) => reachesPremise(reference, seen));
+    reachesPremiseCache.set(id, grounded);
+    return grounded;
+  };
+
+  document.steps.forEach((step, index) => {
+    if (step.type === 'premise') return;
+    const validRefs = graph.get(step.id) ?? [];
+    if (!validRefs.length) {
+      checks.push({
+        id: `ungrounded-${step.id}`,
+        severity: 'error',
+        title: '推导缺少前提支撑',
+        detail: `步骤 ${index + 1} 没有引用任何前置步骤，无法沿引用链回到前提。`,
+        stepId: step.id,
+      });
+    } else if (!reachesPremise(step.id, new Set())) {
+      checks.push({
+        id: `ungrounded-${step.id}`,
+        severity: 'error',
+        title: '推导无法回到前提',
+        detail: `步骤 ${index + 1} 的引用链（${validRefs.map(stepLabel).join('、')}）最终没有连接到任何前提。`,
+        stepId: step.id,
+      });
+    }
+  });
+
+  // 5. 结论步骤必须存在，且结论式子与证明目标逐字相同。
   const goalStep = document.steps.find((step) => step.type === 'goal' && step.rule === '结论');
   if (!goalStep) {
     checks.push({ id: 'goal-missing', severity: 'error', title: '目标未被证明', detail: '请添加“结论”类型的最终步骤。' });
-  } else if (goalStep.references.length === 0) {
-    checks.push({ id: 'goal-unlinked', severity: 'warning', title: '结论尚无推导支撑', detail: '最终步骤没有引用任何前置步骤。', stepId: goalStep.id });
+  } else {
+    const goalIndex = document.steps.indexOf(goalStep);
+    if (normalizeFormula(goalStep.statement) !== normalizeFormula(document.goal)) {
+      checks.push({
+        id: 'goal-mismatch',
+        severity: 'error',
+        title: '结论式子与证明目标不一致',
+        detail: `步骤 ${goalIndex + 1} 的结论式与证明目标不同：目标为 ${document.goal || '（空）'}，结论为 ${goalStep.statement || '（空）'}。`,
+        stepId: goalStep.id,
+      });
+    }
   }
 
-  if (!checks.some((check) => check.severity === 'error')) {
-    checks.push({ id: 'proof-ok', severity: 'info', title: '结构检查通过', detail: '未发现缺失引用、循环引用或未证明目标。' });
+  // 6. 严格定稿判定：目标一致、符号齐全、引用可回溯，三者同时满足才可定稿。
+  const blocking = checks.filter((check) => check.severity === 'error');
+  if (!blocking.length) {
+    checks.push({
+      id: 'proof-finalizable',
+      severity: 'info',
+      title: '可定稿',
+      detail: '结论式子与证明目标相同，公式符号均有说明，且每条推导都能沿引用回到前提。',
+      stepId: goalStep?.id,
+    });
+  } else {
+    const gapKinds: string[] = [];
+    const has = (id: string) => blocking.some((check) => check.id.startsWith(id));
+    if (has('goal-missing') || has('goal-mismatch') || has('goal-empty')) gapKinds.push('结论未与证明目标对齐');
+    if (has('symbol-')) gapKinds.push('存在缺少说明的符号');
+    if (has('missing-') || has('cycle') || has('ungrounded-')) gapKinds.push('引用链存在缺失或无法回到前提');
+    const named = blocking.map((check) => check.detail).join('；');
+    checks.push({
+      id: 'proof-not-final',
+      severity: 'warning',
+      title: '暂不可定稿',
+      detail: `缺口：${gapKinds.join('；') || '存在未解决的检查项'}。${named}`,
+    });
   }
   return checks;
 }
 
-export function compareVersion(document: ProofDocument, version: ProofVersion) {
-  const result = [];
-  const size = Math.max(document.steps.length, version.steps.length);
-  for (let index = 0; index < size; index += 1) {
-    const before = version.steps[index]?.statement ?? '';
-    const after = document.steps[index]?.statement ?? '';
-    const kind = !before ? 'added' : !after ? 'removed' : before === after ? 'same' : 'changed';
-    result.push({ kind, label: `步骤 ${index + 1}`, before, after } as const);
-  }
-  return result;
+function diffKind(before: string, after: string): ProofDiff['kind'] {
+  return !before ? 'added' : !after ? 'removed' : before === after ? 'same' : 'changed';
+}
+
+// 按步骤 id 配对对齐：同 id 视为同一步（拖拽排序不会产生伪差异），
+// 新增步骤按当前稿位置插入，被删除的旧步骤附在末尾标注“旧步骤”。
+function diffSteps(beforeSteps: ProofStep[], afterSteps: ProofStep[]): ProofDiff[] {
+  const rows: ProofDiff[] = [];
+  const beforeById = new Map(beforeSteps.map((step) => [step.id, step]));
+  const matchedBefore = new Set<string>();
+
+  afterSteps.forEach((step, index) => {
+    const before = beforeById.get(step.id);
+    if (!before) {
+      rows.push({ section: 'steps', kind: 'added', label: `步骤 ${index + 1}`, before: '', after: step.statement });
+      return;
+    }
+    matchedBefore.add(step.id);
+    rows.push({
+      section: 'steps',
+      kind: diffKind(before.statement, step.statement),
+      label: `步骤 ${index + 1}`,
+      before: before.statement,
+      after: step.statement,
+    });
+  });
+
+  beforeSteps.forEach((step, index) => {
+    if (!matchedBefore.has(step.id)) {
+      rows.push({ section: 'steps', kind: 'removed', label: `旧步骤 ${index + 1}`, before: step.statement, after: '' });
+    }
+  });
+  return rows;
+}
+
+export function compareVersion(document: ProofDocument, version: ProofVersion): VersionComparison {
+  const rows: ProofDiff[] = [];
+
+  // 目标：单独一行参与增删改比较。
+  rows.push({
+    section: 'goal',
+    kind: diffKind(version.goal, document.goal),
+    label: '证明目标',
+    before: version.goal,
+    after: document.goal,
+  });
+
+  // 符号表：旧快照没有符号表时，符号统一显示为“新增”，旧稿一列照原稿留空。
+  const hasSymbols = version.symbols !== undefined;
+  const beforeSymbols = version.symbols ?? {};
+  const symbolKeys = [...new Set([...Object.keys(beforeSymbols), ...Object.keys(document.symbols)])].sort();
+  symbolKeys.forEach((symbol) => {
+    const before = hasSymbols && symbol in beforeSymbols ? beforeSymbols[symbol] : '';
+    const after = symbol in document.symbols ? document.symbols[symbol] : '';
+    rows.push({
+      section: 'symbols',
+      kind: diffKind(before, after),
+      label: `符号 ${symbol}`,
+      before,
+      after,
+    });
+  });
+
+  rows.push(...diffSteps(version.steps, document.steps));
+  return { rows, hasSymbols };
 }
 
 export function createId(prefix: string): string {

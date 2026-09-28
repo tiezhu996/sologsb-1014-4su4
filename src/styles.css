@@ -102,6 +102,8 @@ button { font: inherit; }
 }
 .version-item:hover, .version-item.is-active { background: #edf3f8; color: var(--blue); }
 .version-item small { color: var(--muted); }
+.version-item-name { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.legacy-tag { padding: 0 5px; height: 16px; line-height: 16px; font-size: 9px; }
 .version-panel .button { margin: 0 10px 10px; width: calc(100% - 20px); }
 .empty-copy { color: var(--muted); font-size: 11px; line-height: 1.6; padding: 8px 12px; }
 .check-summary { padding: 15px; border-radius: 14px; background: #153b5c; color: #fff; box-shadow: 0 8px 22px rgba(21,59,92,.17); }
@@ -113,6 +115,9 @@ button { font: inherit; }
 .check-summary-bars { height: 5px; margin: 14px 0 11px; border-radius: 4px; overflow: hidden; background: rgba(255,255,255,.16); }
 .check-summary-bars span { display: block; height: 100%; background: #6bd6ac; border-radius: inherit; transition: width .25s ease; }
 .check-summary p { margin: 0; font-size: 11px; color: rgba(255,255,255,.72); }
+.check-summary.is-finalizable { background: linear-gradient(150deg, #14523d, #1c6e52); box-shadow: 0 8px 22px rgba(20,82,61,.2); }
+.check-summary.is-finalizable h2::before { content: '✓ '; color: #8fe6c2; }
+.check-item.is-finalizable { border: 1px solid #bfe7d5; font-weight: 700; }
 .editor-column { min-width: 0; display: grid; gap: 12px; }
 .editor-titlebar, .goal-card, .steps-toolbar, .step-card {
   background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
@@ -199,6 +204,18 @@ kbd { padding: 2px 5px; border: 1px solid #c8d1da; border-bottom-width: 2px; bor
 .diff-row.is-changed span:nth-child(2) { background: #fff8e8; }
 .diff-row.is-changed span:nth-child(3) { background: #eef8f3; }
 .diff-label { color: #657385; background: #fafbfc; }
+.diff-section-row {
+  display: grid; grid-template-columns: 1fr 1fr;
+  padding: 8px 12px; position: sticky; top: 37px; z-index: 1;
+  color: #274358; background: #e9f1f7; border-bottom: 1px solid #d7e2eb;
+  font-size: 11px; font-weight: 700; letter-spacing: .04em;
+}
+.diff-section-row span + span { text-align: right; color: var(--muted); font-weight: 600; }
+.diff-legacy-banner {
+  padding: 9px 20px; font-size: 11px; line-height: 1.5;
+  color: #7a5a18; background: #fff7e5; border-bottom: 1px solid #f0dfb0;
+}
+.diff-legacy-banner strong { margin-right: 4px; }
 .toast-notification { position: fixed; right: 24px; bottom: 24px; z-index: 80; padding: 11px 16px; border-radius: 9px; color: #fff; background: #173f60; box-shadow: 0 10px 30px rgba(17,47,70,.25); font-size: 12px; }
 
 @media (max-width: 1220px) {

@@ -146,7 +146,9 @@ export class ProofApp implements Component {
     const errors = checks.filter((check) => check.severity === 'error').length;
     const warnings = checks.filter((check) => check.severity === 'warning').length;
     const selectedVersion = document.versions.find((version) => version.id === store.compareVersionId);
-    const diff = selectedVersion ? compareVersion(document, selectedVersion) : [];
+    const comparison = selectedVersion ? compareVersion(document, selectedVersion) : { rows: [], hasSymbols: true };
+    const diff = comparison.rows;
+    const finalizable = checks.some((check) => check.id === 'proof-finalizable');
 
     return m('div.app-shell', [
       m('header.topbar', [
@@ -186,20 +188,27 @@ export class ProofApp implements Component {
               class: version.id === store.compareVersionId ? 'is-active' : '',
               onclick: () => { store.compareVersionId = store.compareVersionId === version.id ? '' : version.id; m.redraw(); },
             }, [
-              m('span', version.name),
+              m('span.version-item-name', [
+                m('span', version.name),
+                version.symbols === undefined && m('span.tag.is-warning.legacy-tag', '旧版'),
+              ]),
               m('small', new Date(version.createdAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })),
             ]))),
             m('button.button.is-fullwidth.is-small', { onclick: () => { store.createVersion(); m.redraw(); } }, '＋ 保存当前版本'),
           ]),
-          m('section.check-summary', [
+          m('section.check-summary', { class: finalizable ? 'is-finalizable' : '' }, [
             m('div.check-summary-head', [
-              m('div', [m('span.eyebrow', 'LIVE CHECK'), m('h2', '证明检查')]),
+              m('div', [m('span.eyebrow', 'LIVE CHECK'), m('h2', finalizable ? '可定稿' : '证明检查')]),
               m('span.check-total', { class: errors ? 'has-error' : '' }, errors + warnings),
             ]),
             m('div.check-summary-bars', [
               m('span', { style: { width: `${Math.max(8, 100 - errors * 24 - warnings * 12)}%` } }),
             ]),
-            m('p', errors ? '修正错误后再保存为定稿。' : warnings ? '结构有效，仍有待核对项。' : '当前结构与引用关系完整。'),
+            m('p', finalizable
+              ? '结论与目标一致、符号齐全、引用可回溯。'
+              : errors ? '存在阻断项，暂不可定稿，请按检查结果逐条修正。'
+                : warnings ? '结构有效，仍有待核对项。'
+                  : '当前结构与引用关系完整。'),
           ]),
         ]),
         m('section.editor-column', [
@@ -339,7 +348,7 @@ export class ProofApp implements Component {
           m('section.panel.checks-panel', [
             m('div.panel-heading', [m('span', '检查结果'), m('span.count-badge', checks.length)]),
             m('div.check-list', checks.map((check) => m('button.check-item', {
-              class: check.severity,
+              class: check.severity + (check.id === 'proof-finalizable' ? ' is-finalizable' : ''),
               onclick: () => { if (check.stepId) { store.selectStep(check.stepId); globalThis.document.querySelector(`[data-step="${check.stepId}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' }); } m.redraw(); },
             }, [
               m('span.check-icon', check.severity === 'error' ? '×' : check.severity === 'warning' ? '!' : '✓'),
@@ -366,13 +375,24 @@ export class ProofApp implements Component {
             m('span.tag.is-warning', `修改 ${diff.filter((item) => item.kind === 'changed').length}`),
             m('span.tag.is-light', `未变 ${diff.filter((item) => item.kind === 'same').length}`),
           ]),
+          !comparison.hasSymbols && m('div.diff-legacy-banner', [
+            m('strong', '旧版快照缺少符号表：'),
+            '该版本保存时尚未记录符号说明，符号比较以原稿留空（—）显示，目标与步骤仍可正常对照。',
+          ]),
           m('div.diff-table', [
             m('div.diff-row.diff-header', [m('span', '位置'), m('span', '旧版本'), m('span', '当前版本')]),
-            ...diff.map((item) => m('div.diff-row', { class: `is-${item.kind}` }, [
-              m('span.diff-label', item.label),
-              m('span', item.before || '—'),
-              m('span', item.after || '—'),
-            ])),
+            ...(['goal', 'symbols', 'steps'] as const).flatMap((section) => {
+              const sectionRows = diff.filter((item) => item.section === section);
+              const title = section === 'goal' ? '证明目标' : section === 'symbols' ? '符号表' : '证明步骤';
+              return [
+                m('div.diff-section-row', [m('span', title), m('span', `${sectionRows.filter((item) => item.kind !== 'same').length} 项变化`)]),
+                ...sectionRows.map((item) => m('div.diff-row', { class: `is-${item.kind}` }, [
+                  m('span.diff-label', item.label),
+                  m('span', item.before ? renderRichText(item.before) : '—'),
+                  m('span', item.after ? renderRichText(item.after) : '—'),
+                ])),
+              ];
+            }),
           ]),
         ]),
       ]),

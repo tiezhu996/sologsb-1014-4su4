@@ -18,6 +18,8 @@ export interface ProofVersion {
   createdAt: string;
   steps: ProofStep[];
   goal: string;
+  // 旧版本快照可能没有符号表，保留可选以便旧稿仍可打开比较。
+  symbols?: Record<string, string>;
 }
 
 export interface ProofDocument {
@@ -40,8 +42,15 @@ export interface ProofCheck {
 }
 
 export interface ProofDiff {
+  section: 'goal' | 'symbols' | 'steps';
   kind: 'same' | 'added' | 'removed' | 'changed';
   label: string;
   before: string;
   after: string;
+}
+
+export interface VersionComparison {
+  rows: ProofDiff[];
+  // 旧快照没有符号表时为 false，界面照原稿显示并提示缺失。
+  hasSymbols: boolean;
 }
