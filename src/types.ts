@@ -12,12 +12,15 @@ export interface ProofStep {
   alternative: string;
 }
 
+export type DiffSection = 'goal' | 'symbol' | 'step';
+
 export interface ProofVersion {
   id: string;
   name: string;
   createdAt: string;
   steps: ProofStep[];
   goal: string;
+  symbols: Record<string, string>;
 }
 
 export interface ProofDocument {
@@ -40,8 +43,11 @@ export interface ProofCheck {
 }
 
 export interface ProofDiff {
+  section: DiffSection;
   kind: 'same' | 'added' | 'removed' | 'changed';
   label: string;
   before: string;
   after: string;
 }
+
+export const FINALIZABLE_CHECK_ID = 'proof-finalizable';

@@ -1,7 +1,8 @@
 import m, { type Component } from 'mithril';
 import katex from 'katex';
 import { compareVersion, ProofStore, RULES } from './store';
-import type { ProofDocument, ProofStep } from './types';
+import { FINALIZABLE_CHECK_ID } from './types';
+import type { ProofDiff, ProofDocument, ProofStep } from './types';
 
 const store = new ProofStore();
 
@@ -145,8 +146,15 @@ export class ProofApp implements Component {
     const checks = store.checks;
     const errors = checks.filter((check) => check.severity === 'error').length;
     const warnings = checks.filter((check) => check.severity === 'warning').length;
+    const finalizable = checks.some((check) => check.id === FINALIZABLE_CHECK_ID);
     const selectedVersion = document.versions.find((version) => version.id === store.compareVersionId);
     const diff = selectedVersion ? compareVersion(document, selectedVersion) : [];
+    const diffGroups: Array<{ section: ProofDiff['section']; title: string; rows: ProofDiff[] }> = [
+      { section: 'goal', title: '证明目标', rows: diff.filter((item) => item.section === 'goal') },
+      { section: 'symbol', title: '符号表', rows: diff.filter((item) => item.section === 'symbol') },
+      { section: 'step', title: '证明步骤', rows: diff.filter((item) => item.section === 'step') },
+    ];
+    const countDiff = (kind: ProofDiff['kind']) => diff.filter((item) => item.kind === kind).length;
 
     return m('div.app-shell', [
       m('header.topbar', [
@@ -155,8 +163,14 @@ export class ProofApp implements Component {
           m('div', [m('p.eyebrow', 'FORMAL NOTEBOOK'), m('h1', '格致 · 证明编辑器')]),
         ]),
         m('div.topbar-center', [
-          m('span.status-dot', { class: errors ? 'has-error' : 'is-ok' }),
-          errors ? `${errors} 个结构错误` : '证明结构可检查',
+          m('span.status-dot', { class: errors ? 'has-error' : finalizable ? 'is-final' : 'is-ok' }),
+          errors
+            ? `${errors} 个结构错误，不能定稿`
+            : finalizable
+              ? '满足三项定稿条件，可定稿'
+              : warnings
+                ? `${warnings} 项核对缺口，尚不可定稿`
+                : '存在推导缺口，尚不可定稿',
           m('span.topbar-separator'),
           `自动保存于 ${new Date(document.updatedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`,
         ]),
@@ -191,15 +205,21 @@ export class ProofApp implements Component {
             ]))),
             m('button.button.is-fullwidth.is-small', { onclick: () => { store.createVersion(); m.redraw(); } }, '＋ 保存当前版本'),
           ]),
-          m('section.check-summary', [
+          m('section.check-summary', { class: finalizable ? 'is-final' : '' }, [
             m('div.check-summary-head', [
               m('div', [m('span.eyebrow', 'LIVE CHECK'), m('h2', '证明检查')]),
-              m('span.check-total', { class: errors ? 'has-error' : '' }, errors + warnings),
+              m('span.check-total', { class: errors ? 'has-error' : finalizable ? 'is-final' : '' }, finalizable ? '✓' : errors + warnings),
             ]),
             m('div.check-summary-bars', [
-              m('span', { style: { width: `${Math.max(8, 100 - errors * 24 - warnings * 12)}%` } }),
+              m('span', { style: { width: `${finalizable ? 100 : Math.max(8, 100 - errors * 24 - warnings * 12)}%` } }),
             ]),
-            m('p', errors ? '修正错误后再保存为定稿。' : warnings ? '结构有效，仍有待核对项。' : '当前结构与引用关系完整。'),
+            m('p', finalizable
+              ? '结论＝目标、符号齐全、引用可回溯到前提，可定稿。'
+              : errors
+                ? '存在错误：结论未对齐目标或引用链断裂，不能定稿。'
+                : warnings
+                  ? '结构无报错，但符号说明等仍有待核对项。'
+                  : '尚未满足定稿条件，请查看右侧检查结果。'),
           ]),
         ]),
         m('section.editor-column', [
@@ -339,7 +359,7 @@ export class ProofApp implements Component {
           m('section.panel.checks-panel', [
             m('div.panel-heading', [m('span', '检查结果'), m('span.count-badge', checks.length)]),
             m('div.check-list', checks.map((check) => m('button.check-item', {
-              class: check.severity,
+              class: `${check.severity}${check.id === FINALIZABLE_CHECK_ID ? ' is-finalizable' : ''}`,
               onclick: () => { if (check.stepId) { store.selectStep(check.stepId); globalThis.document.querySelector(`[data-step="${check.stepId}"]`)?.scrollIntoView({ block: 'center', behavior: 'smooth' }); } m.redraw(); },
             }, [
               m('span.check-icon', check.severity === 'error' ? '×' : check.severity === 'warning' ? '!' : '✓'),
@@ -361,18 +381,21 @@ export class ProofApp implements Component {
             m('button.delete', { onclick: () => { store.compareVersionId = ''; m.redraw(); } }),
           ]),
           m('div.diff-summary', [
-            m('span.tag.is-danger', `删除 ${diff.filter((item) => item.kind === 'removed').length}`),
-            m('span.tag.is-success', `新增 ${diff.filter((item) => item.kind === 'added').length}`),
-            m('span.tag.is-warning', `修改 ${diff.filter((item) => item.kind === 'changed').length}`),
-            m('span.tag.is-light', `未变 ${diff.filter((item) => item.kind === 'same').length}`),
+            m('span.tag.is-danger', `删除 ${countDiff('removed')}`),
+            m('span.tag.is-success', `新增 ${countDiff('added')}`),
+            m('span.tag.is-warning', `修改 ${countDiff('changed')}`),
+            m('span.tag.is-light', `未变 ${countDiff('same')}`),
           ]),
           m('div.diff-table', [
-            m('div.diff-row.diff-header', [m('span', '位置'), m('span', '旧版本'), m('span', '当前版本')]),
-            ...diff.map((item) => m('div.diff-row', { class: `is-${item.kind}` }, [
-              m('span.diff-label', item.label),
-              m('span', item.before || '—'),
-              m('span', item.after || '—'),
-            ])),
+            m('div.diff-row.diff-header', [m('span', '项目'), m('span', '旧版本'), m('span', '当前版本')]),
+            ...diffGroups.flatMap((group) => [
+              m('div.diff-section-head', group.title),
+              ...group.rows.map((item) => m('div.diff-row', { class: `is-${item.kind}` }, [
+                m('span.diff-label', item.label),
+                m('span', item.before),
+                m('span', item.after),
+              ])),
+            ]),
           ]),
         ]),
       ]),

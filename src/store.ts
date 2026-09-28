@@ -1,5 +1,6 @@
 import { redraw } from 'mithril';
-import type { ProofCheck, ProofDocument, ProofStep, ProofVersion } from './types';
+import { FINALIZABLE_CHECK_ID } from './types';
+import type { ProofCheck, ProofDiff, ProofDocument, ProofStep, ProofVersion } from './types';
 
 const STORAGE_KEY = 'sologsb-1014-proof-workspace-v1';
 const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -57,7 +58,16 @@ function loadDocuments(): ProofDocument[] {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return initialDocuments();
     const parsed = JSON.parse(raw) as ProofDocument[];
-    return Array.isArray(parsed) && parsed.length ? parsed : initialDocuments();
+    if (Array.isArray(parsed) && parsed.length) {
+      // 兼容旧版快照：早期版本没有保存符号表，补齐后仍可正常打开与比较。
+      parsed.forEach((document) => {
+        document.versions?.forEach((version) => {
+          if (!version.symbols) version.symbols = {};
+        });
+      });
+      return parsed;
+    }
+    return initialDocuments();
   } catch {
     return initialDocuments();
   }
@@ -220,6 +230,7 @@ export class ProofStore {
         createdAt: new Date().toISOString(),
         steps: clone(document.steps),
         goal: document.goal,
+        symbols: clone(document.symbols),
       };
       document.versions.unshift(version);
       this.compareVersionId = version.id;
@@ -238,30 +249,109 @@ export class ProofStore {
   }
 }
 
-function stripLatexCommands(text: string): string {
-  return text.replace(/\\[A-Za-z]+/g, ' ').replace(/[{}_^]/g, ' ');
+const STEPTYPE_SHORT: Record<ProofStep['type'], string> = { premise: '前提', derivation: '推导', goal: '结论' };
+
+/** 取出公式中出现的“字母段”：已剔除 LaTeX 命令、数字与其他符号；希腊字母命令随反斜杠一并剔除。 */
+function formulaRuns(text: string): string[] {
+  return (text
+    .replace(/\\[A-Za-z]+/g, ' ')
+    .replace(/[0-9]+/g, ' ')
+    .replace(/[^A-Za-zΑ-Ωα-ω']/g, ' ')
+    .match(/[A-Za-zΑ-Ωα-ω']+/g) ?? [])
+    .map((run) => run.replace(/'+/g, ''))
+    .filter((run) => /[A-Za-zΑ-Ωα-ω]/.test(run));
+}
+
+/** 找出公式里未在符号表登记的符号：并置字母（如 ab）按单字母逐一核对。 */
+function unknownSymbols(text: string, symbolKeys: Set<string>): string[] {
+  const unknown: string[] = [];
+  formulaRuns(text).forEach((run) => {
+    if (symbolKeys.has(run)) return;
+    const letters = run.match(/[A-Za-zΑ-Ωα-ω]/g) ?? [];
+    if (run.length === 1) unknown.push(run);
+    else letters.forEach((letter) => { if (!symbolKeys.has(letter)) unknown.push(letter); });
+  });
+  return [...new Set(unknown)];
+}
+
+/** 比较两条公式是否同一个式子：忽略 $、空白、花括号、间距与左右定界符等排版差异。 */
+function normalizeFormula(text: string): string {
+  return text
+    .replace(/\\(left|right|displaystyle|big|Big|bigg|Bigg|!|,|;| )/g, '')
+    .replace(/\$+/g, '')
+    .replace(/[{}]/g, '')
+    .replace(/\s+/g, '');
+}
+
+/** 非前提步骤必须能沿引用链回到前提；返回做不到的步骤。 */
+function findUngroundedSteps(steps: ProofStep[], ids: Set<string>): ProofStep[] {
+  const refsById = new Map(steps.map((step) => [step.id, step.references.filter((id) => ids.has(id))]));
+  const grounded = new Set<string>();
+  const ungrounded = new Set<string>();
+  const visiting = new Set<string>();
+  const reachesPremise = (id: string): boolean => {
+    const step = steps.find((item) => item.id === id);
+    if (!step || step.type === 'premise') return !!step && step.type === 'premise';
+    if (grounded.has(id)) return true;
+    if (ungrounded.has(id)) return false;
+    if (visiting.has(id)) return false; // 引用链成环，无法回到前提
+    visiting.add(id);
+    const refs = refsById.get(id) ?? [];
+    const ok = refs.length > 0 && refs.every(reachesPremise);
+    visiting.delete(id);
+    (ok ? grounded : ungrounded).add(id);
+    return ok;
+  };
+  steps.forEach((step) => reachesPremise(step.id));
+  return steps.filter((step) => step.type !== 'premise' && ungrounded.has(step.id));
 }
 
 export function validate(document: ProofDocument): ProofCheck[] {
   const checks: ProofCheck[] = [];
   const ids = new Set(document.steps.map((step) => step.id));
   const symbolKeys = new Set(Object.keys(document.symbols));
-  const ignored = new Set(['a', 'A', 'b', 'B', 'n', 'k', 'P', 'Q', 'R', 'x', 'y', 'to', 'text', 'frac', 'sqrt']);
+  const stepNumber = (id: string) => document.steps.findIndex((step) => step.id === id) + 1;
+  const shortRef = (id: string) => id.replace(/^step-/, '').slice(-4).toUpperCase();
 
+  // 1. 公式符号都要有说明（步骤式子与证明目标都要查）。
   document.steps.forEach((step, index) => {
-    const tokens = stripLatexCommands(step.statement).match(/\b[A-Za-z][A-Za-z0-9']*\b/g) ?? [];
-    const unknown = [...new Set(tokens.filter((token) => !symbolKeys.has(token) && !ignored.has(token)))];
+    const unknown = unknownSymbols(step.statement, symbolKeys);
     if (unknown.length) {
-      checks.push({ id: `symbol-${step.id}`, severity: 'warning', title: '发现未定义符号', detail: `步骤 ${index + 1} 使用了：${unknown.join('、')}`, stepId: step.id });
+      checks.push({
+        id: `symbol-${step.id}`,
+        severity: 'warning',
+        title: '公式符号缺少说明',
+        detail: `步骤 ${index + 1}（${STEPTYPE_SHORT[step.type]}）使用的 ${unknown.join('、')} 未在符号表中说明。`,
+        stepId: step.id,
+      });
     }
+  });
+  const unknownGoalSymbols = unknownSymbols(document.goal, symbolKeys);
+  if (unknownGoalSymbols.length) {
+    checks.push({
+      id: 'symbol-goal',
+      severity: 'warning',
+      title: '目标符号缺少说明',
+      detail: `证明目标中的 ${unknownGoalSymbols.join('、')} 未在符号表中说明。`,
+    });
+  }
 
+  // 2. 引用的步骤必须存在。
+  document.steps.forEach((step, index) => {
     step.references.forEach((reference) => {
       if (!ids.has(reference)) {
-        checks.push({ id: `missing-${step.id}-${reference}`, severity: 'error', title: '引用步骤不存在', detail: `步骤 ${index + 1} 引用了已删除的步骤 ${reference}`, stepId: step.id });
+        checks.push({
+          id: `missing-${step.id}-${reference}`,
+          severity: 'error',
+          title: '引用步骤不存在',
+          detail: `步骤 ${index + 1} 引用的步骤 ${shortRef(reference)} 已不存在，请重新选择依据。`,
+          stepId: step.id,
+        });
       }
     });
   });
 
+  // 3. 引用链不能成环。
   const graph = new Map(document.steps.map((step) => [step.id, step.references.filter((id) => ids.has(id))]));
   const visiting = new Set<string>();
   const visited = new Set<string>();
@@ -280,30 +370,99 @@ export function validate(document: ProofDocument): ProofCheck[] {
   };
   [...graph.keys()].forEach((id) => visit(id, []));
   if (cycleStep.size) {
-    checks.push({ id: 'cycle', severity: 'error', title: '检测到循环引用', detail: '引用链形成闭环，请调整步骤关系。', stepId: [...cycleStep][0] });
+    checks.push({
+      id: 'cycle',
+      severity: 'error',
+      title: '检测到循环引用',
+      detail: `步骤 ${[...cycleStep].map(stepNumber).filter(Boolean).join('、')} 的引用链形成闭环，请调整步骤关系。`,
+      stepId: [...cycleStep][0],
+    });
   }
 
-  const goalStep = document.steps.find((step) => step.type === 'goal' && step.rule === '结论');
-  if (!goalStep) {
-    checks.push({ id: 'goal-missing', severity: 'error', title: '目标未被证明', detail: '请添加“结论”类型的最终步骤。' });
-  } else if (goalStep.references.length === 0) {
-    checks.push({ id: 'goal-unlinked', severity: 'warning', title: '结论尚无推导支撑', detail: '最终步骤没有引用任何前置步骤。', stepId: goalStep.id });
+  // 4. 结论式子必须与证明目标相同。
+  const conclusion = [...document.steps].reverse().find((step) => step.type === 'goal' && step.rule === '结论');
+  if (!conclusion) {
+    checks.push({ id: 'goal-missing', severity: 'error', title: '目标未被证明', detail: '缺少类型为“目标 / 结论”、推理规则为“结论”的最终步骤，不能定稿。' });
+  } else if (normalizeFormula(conclusion.statement) !== normalizeFormula(document.goal)) {
+    checks.push({
+      id: 'goal-mismatch',
+      severity: 'error',
+      title: '结论式子与证明目标不一致',
+      detail: `步骤 ${stepNumber(conclusion.id)} 的结论“${conclusion.statement.replace(/\$/g, '')}”与目标“${document.goal.replace(/\$/g, '')}”不相同，不能定稿。`,
+      stepId: conclusion.id,
+    });
   }
 
-  if (!checks.some((check) => check.severity === 'error')) {
-    checks.push({ id: 'proof-ok', severity: 'info', title: '结构检查通过', detail: '未发现缺失引用、循环引用或未证明目标。' });
+  // 5. 每条推导都要能沿引用回到前提。
+  findUngroundedSteps(document.steps, ids).forEach((step) => {
+    if (step.references.some((reference) => !ids.has(reference))) return; // 已由“引用步骤不存在”点名
+    const number = stepNumber(step.id);
+    const isGoal = step.type === 'goal';
+    const detail = step.references.length === 0
+      ? `步骤 ${number}（${STEPTYPE_SHORT[step.type]}）没有引用任何依据，无法回溯到前提。`
+      : `步骤 ${number}（${STEPTYPE_SHORT[step.type]}）的引用链无法回到前提，请在第 ${number} 步之前补齐断链的推导。`;
+    checks.push({
+      id: `ungrounded-${step.id}`,
+      severity: 'error',
+      title: isGoal ? '结论无法回溯到前提' : '推导无法沿引用回到前提',
+      detail,
+      stepId: step.id,
+    });
+  });
+
+  // 6. 三项条件同时满足才标成可定稿；结构没报错但有缺口时不出现本项。
+  if (checks.length === 0 && conclusion) {
+    checks.push({
+      id: FINALIZABLE_CHECK_ID,
+      severity: 'info',
+      title: '可定稿',
+      detail: '结论式子与证明目标一致，公式符号均有说明，且每条推导都能沿引用回到前提。',
+    });
   }
   return checks;
 }
 
-export function compareVersion(document: ProofDocument, version: ProofVersion) {
-  const result = [];
+export function compareVersion(document: ProofDocument, version: ProofVersion): ProofDiff[] {
+  const result: ProofDiff[] = [];
+
+  // 证明目标
+  const goalBefore = version.goal ?? '';
+  const goalAfter = document.goal ?? '';
+  result.push({
+    section: 'goal',
+    kind: !goalBefore ? 'added' : !goalAfter ? 'removed' : goalBefore === goalAfter ? 'same' : 'changed',
+    label: '证明目标',
+    before: goalBefore || '—',
+    after: goalAfter || '—',
+  });
+
+  // 符号表：旧快照没有符号表（早期版本）时，按原稿空缺显示，当前符号记为新增。
+  const beforeSymbols = version.symbols ?? {};
+  const afterSymbols = document.symbols ?? {};
+  [...new Set([...Object.keys(beforeSymbols), ...Object.keys(afterSymbols)])].sort().forEach((name) => {
+    const before = beforeSymbols[name];
+    const after = afterSymbols[name];
+    result.push({
+      section: 'symbol',
+      kind: before === undefined ? 'added' : after === undefined ? 'removed' : before === after ? 'same' : 'changed',
+      label: `符号 ${name}`,
+      before: before ?? '—',
+      after: after ?? '—',
+    });
+  });
+
+  // 证明步骤（按位置逐条比对式子）
   const size = Math.max(document.steps.length, version.steps.length);
   for (let index = 0; index < size; index += 1) {
     const before = version.steps[index]?.statement ?? '';
     const after = document.steps[index]?.statement ?? '';
-    const kind = !before ? 'added' : !after ? 'removed' : before === after ? 'same' : 'changed';
-    result.push({ kind, label: `步骤 ${index + 1}`, before, after } as const);
+    result.push({
+      section: 'step',
+      kind: !before ? 'added' : !after ? 'removed' : before === after ? 'same' : 'changed',
+      label: `步骤 ${index + 1}`,
+      before: before || '—',
+      after: after || '—',
+    });
   }
   return result;
 }
